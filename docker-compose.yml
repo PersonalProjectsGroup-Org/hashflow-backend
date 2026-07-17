@@ -1,0 +1,48 @@
+services:
+  # service-telemetry database
+  postgres-telemetry:
+    image: postgres:16-alpine
+    container_name: hashflow-db-telemetry
+    environment:
+      POSTGRES_DB: hashflow_telemetry
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: devpass
+    ports:
+      - "5432:5432"
+
+  # service-financial database
+  postgres-financial:
+    image: postgres:16-alpine
+    container_name: hashflow-db-financial
+    environment:
+      POSTGRES_DB: hashflow_financial
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: devpass
+    ports:
+      - "5433:5432"
+
+  # service-news database
+  postgres-news:
+    image: postgres:16-alpine
+    container_name: hashflow-db-news
+    environment:
+      POSTGRES_DB: hashflow_news
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: devpass
+    ports:
+      - "5434:5432"
+
+  # Using Redis for cache synchronization and WebSockets for service-agent communication
+  redis:
+    image: redis:7-alpine
+    container_name: hashflow-redis
+    ports:
+      - "6379:6379"
+
+  # RabbitMQ for asynchronous webhook queues and heavy alerts.
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: hashflow-rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672" # RabbitMQ Dashboard (User/Pass: guest)
