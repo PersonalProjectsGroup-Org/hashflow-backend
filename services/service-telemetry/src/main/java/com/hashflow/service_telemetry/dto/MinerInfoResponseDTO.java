@@ -1,8 +1,8 @@
 package com.hashflow.service_telemetry.dto;
 
-import com.hashflow.telemetry.model.Coin;
-import com.hashflow.telemetry.model.MinerType;
-import com.hashflow.telemetry.model.Status;
+import com.hashflow.service_telemetry.model.Coin;
+import com.hashflow.service_telemetry.model.MinerType;
+import com.hashflow.service_telemetry.model.Status;
 
 import java.time.LocalDateTime;
 
