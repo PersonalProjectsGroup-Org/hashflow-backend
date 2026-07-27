@@ -6,7 +6,7 @@ services:
     environment:
       POSTGRES_DB: hashflow_telemetry
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: devpass
+      POSTGRES_PASSWORD: root
     ports:
       - "5432:5432"
 
@@ -17,7 +17,7 @@ services:
     environment:
       POSTGRES_DB: hashflow_financial
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: devpass
+      POSTGRES_PASSWORD: root
     ports:
       - "5433:5432"
 
@@ -28,7 +28,7 @@ services:
     environment:
       POSTGRES_DB: hashflow_news
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: devpass
+      POSTGRES_PASSWORD: root
     ports:
       - "5434:5432"
 
