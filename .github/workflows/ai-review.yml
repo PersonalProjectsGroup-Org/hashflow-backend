@@ -1,0 +1,213 @@
+name: AI Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+# Cancel a running review if new commits are pushed to the PR.
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    # Run on PR events, or on a "/review" comment on a pull request.
+    if: |
+      github.event_name == 'pull_request' ||
+      (github.event.issue.pull_request && startsWith(github.event.comment.body || '', '/review'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Reviews are informational: never turn the PR red if the API hiccups.
+    continue-on-error: true
+    env:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      # openrouter/free auto-routes to the best available free model, so it
+      # keeps working as free models come and go. Pin a specific slug (e.g.
+      # google/gemma-4-31b-it:free) if you want consistent model quality.
+      MODEL: openrouter/free
+      MAX_DIFF_CHARS: 30000
+      PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+
+    steps:
+      - name: Resolve PR head and base
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          else
+            # issue_comment (/review): the SHAs are not in the event; look them up.
+            HEAD_SHA=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" -q '.head.sha')
+            BASE_SHA=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" -q '.base.sha')
+          fi
+          echo "HEAD_SHA=$HEAD_SHA" >> "$GITHUB_ENV"
+          echo "BASE_SHA=$BASE_SHA" >> "$GITHUB_ENV"
+
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.HEAD_SHA }}
+          fetch-depth: 0
+
+      - name: Warn when API key is missing
+        if: env.OPENROUTER_API_KEY == ''
+        run: echo "::warning::OPENROUTER_API_KEY secret is not set — AI review skipped. Add it in Settings → Secrets and variables → Actions."
+
+      - name: Authorize /review (write access only)
+        # Prevents anyone without write access (or the bot itself) from
+        # triggering reviews and burning Actions minutes.
+        if: github.event_name == 'issue_comment'
+        env:
+          AUTHOR_ASSOCIATION: ${{ github.event.comment.author_association }}
+        run: |
+          case "$AUTHOR_ASSOCIATION" in
+            OWNER|MEMBER|COLLABORATOR)
+              echo "AUTHORIZED=true" >> "$GITHUB_ENV"
+              ;;
+            *)
+              echo "AUTHORIZED=false" >> "$GITHUB_ENV"
+              echo "::warning::User ${{ github.actor }} cannot trigger /review (write access required)."
+              ;;
+          esac
+
+      - name: Run AI review
+        if: env.OPENROUTER_API_KEY != '' && (github.event_name == 'pull_request' || env.AUTHORIZED == 'true')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          BASE="$BASE_SHA"
+
+          # Compute the PR diff (changes on the head branch since it diverged from base).
+          git diff "$BASE"...HEAD > /tmp/pr.diff || true
+
+          if [ ! -s /tmp/pr.diff ]; then
+            gh pr comment "$PR_NUMBER" --body "🤖 AI review: no code changes to review in this PR."
+            exit 0
+          fi
+
+          # Keep very large diffs within the model's context window.
+          if [ "$(wc -c < /tmp/pr.diff)" -gt "$MAX_DIFF_CHARS" ]; then
+            head -c "$MAX_DIFF_CHARS" /tmp/pr.diff > /tmp/pr.truncated.diff
+            mv /tmp/pr.truncated.diff /tmp/pr.diff
+          fi
+
+          # Extract (path, new-file line) pairs for lines ADDED in this diff.
+          # Only those lines can receive inline review comments.
+          awk '
+          /^\+\+\+ b\// { path=$0; sub(/^\+\+\+ b\//,"",path); next }
+          /^@@ / { s=$0; sub(/^@@ -[0-9]+(,[0-9]+)? \+/,"",s); sub(/,.*/,"",s); new_line=s+0; next }
+          /^\+/ && !/^\+\+\+/ { print path "\t" new_line; new_line++; next }
+          /^ / { new_line++ }
+          ' /tmp/pr.diff > /tmp/valid_lines.txt || true
+
+          PAYLOAD=$(jq -n \
+              --arg model "$MODEL" \
+              --rawfile diff /tmp/pr.diff \
+              '{
+                model: $model,
+                temperature: 0.2,
+                messages: [
+                  {
+                    role: "system",
+                    content: "You are a senior code reviewer for a Java + Spring Boot backend project (multi-module Gradle microservices). Review the pull request diff. Be concise and concrete. Flag real issues only — avoid nitpicks and false positives. Reply in the language of the PR description if it is not English."
+                  },
+                  {
+                    role: "user",
+                    content: ("Review this pull request diff. Respond with ONLY a JSON object — no markdown fences, no extra text. Shape:\n{\"summary\": \"2-3 sentence overview of what the PR does and your overall impression\", \"comments\": [{\"path\": \"path/to/File.java\", \"line\": 42, \"severity\": \"ERROR|WARNING|SUGGESTION\", \"message\": \"short description and suggested fix\", \"suggestion\": \"optional replacement code for that one line\"}]}\n\nRules:\n- \"path\" must match the diff exactly; \"line\" must be the line number in the NEW version of the file and must be a line added by this PR.\n- \"suggestion\" is optional: for issues with a clear mechanical fix, include the full replacement for the flagged line only, with the same indentation as the original line. Never wrap it in markdown fences.\n- Flag only real issues, at most 10 comments. Focus on bugs, logic errors, missing error handling, security problems (hardcoded secrets, unsafe patterns), concurrency and null-safety issues, and Spring/Java pitfalls (bean wiring, transactions, exception handling, resource leaks).\n- If there are no issues, return {\"summary\": \"...\", \"comments\": []}.\n\nDiff (truncated to the first part if very large):\n" + $diff)
+                  }
+                ]
+              }')
+
+          # Call the model with retries: free tiers are sometimes transiently unavailable.
+          RESPONSE=""
+          for attempt in 1 2 3; do
+            RESPONSE=$(curl -sS --max-time 90 https://openrouter.ai/api/v1/chat/completions \
+              -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "$PAYLOAD" || true)
+            if printf '%s' "$RESPONSE" | jq -e '.choices[0].message.content // empty' >/dev/null 2>&1; then
+              break
+            fi
+            echo "::warning::OpenRouter request attempt $attempt/3 failed; retrying in $((attempt * 5))s..."
+            sleep "$((attempt * 5))"
+          done
+
+          REVIEW_JSON=$(printf '%s' "$RESPONSE" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
+
+          # Model reply should be a JSON object: {summary, comments:[{path,line,severity,message}]}
+          SUMMARY=$(printf '%s' "$REVIEW_JSON" | jq -r '.summary // empty' 2>/dev/null || true)
+
+          if [ -z "$SUMMARY" ]; then
+            # Not JSON: post whatever the model said as a plain comment (or the API error).
+            if [ -z "$REVIEW_JSON" ]; then
+              ERROR=$(printf '%s' "$RESPONSE" | jq -r '.error.message // empty' 2>/dev/null || true)
+              [ -z "$ERROR" ] && ERROR="OpenRouter request failed after 3 attempts (check the Actions log for details)"
+              echo "::warning::OpenRouter review failed: $ERROR"
+              echo "::debug::OpenRouter response: $(printf '%s' "$RESPONSE" | head -c 500)"
+              gh pr comment "$PR_NUMBER" --body "🤖 AI review failed: $ERROR" || true
+            else
+              BODY=$(cat <<EOF
+          ## 🤖 AI Code Review
+          Model: \`$MODEL\`
+
+          $REVIEW_JSON
+          EOF
+          )
+              gh pr comment "$PR_NUMBER" --body "$BODY" || true
+            fi
+            exit 0
+          fi
+
+          # Keep only comments whose (path, line) is actually an added line in
+          # the diff, so the API never rejects the review with a 422.
+          COMMENTS=$(printf '%s' "$REVIEW_JSON" | jq -c --rawfile valid /tmp/valid_lines.txt '
+            [.comments[]? | select(
+              ((.path // "") + "\t" + ((.line // -1) | tostring)) as $k |
+              ($valid | split("\n") | index($k))
+            ) | {
+              path: .path,
+              line: .line,
+              body: (
+                ("[" + ((.severity // "SUGGESTION") | ascii_upcase) + "] " + (.message // "")) +
+                (if (.suggestion? and (.suggestion | type) == "string" and (.suggestion | length) > 0)
+                 then "\n\n```suggestion\n" + .suggestion + "\n```"
+                 else "" end)
+              )
+            }]' 2>/dev/null || true)
+
+          echo "Model returned $(printf '%s' "$REVIEW_JSON" | jq '.comments | length' 2>/dev/null || echo 'n/a') comment(s); $(printf '%s' "$COMMENTS" | jq 'length' 2>/dev/null || echo 'n/a') after diff filtering."
+          if [ "$(printf '%s' "$COMMENTS" | jq 'length' 2>/dev/null || echo 0)" -eq 0 ]; then
+            echo "Model output (first 400 chars):"
+            printf '%s' "$REVIEW_JSON" | head -c 400
+            echo ""
+          fi
+
+          if [ "$(printf '%s' "$COMMENTS" | jq 'length' 2>/dev/null || echo 0)" -gt 0 ]; then
+            BODY=$(jq -n \
+              --arg commit_id "$(git rev-parse HEAD)" \
+              --arg summary "$SUMMARY" \
+              --argjson comments "$COMMENTS" \
+              '{event: "COMMENT", commit_id: $commit_id, body: $summary, comments: $comments}')
+            if printf '%s' "$BODY" | gh api --method POST "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/reviews" --input - >/dev/null 2>&1; then
+              echo "Posted review with $(printf '%s' "$COMMENTS" | jq 'length') inline comment(s)."
+              exit 0
+            fi
+            echo "::warning::Inline review failed; posting a plain summary comment instead."
+          fi
+
+          BODY=$(cat <<EOF
+          ## 🤖 AI Code Review
+          Model: \`$MODEL\`
+
+          $SUMMARY
+          EOF
+          )
+          gh pr comment "$PR_NUMBER" --body "$BODY" || true
