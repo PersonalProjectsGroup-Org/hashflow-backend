@@ -1,0 +1,9 @@
+{
+  "ai": "claude",
+  "feature_numbering": "sequential",
+  "specify_version": "0.16.1",
+  "integrations": [
+    "claude"
+  ],
+  "script_type": "sh"
+}
