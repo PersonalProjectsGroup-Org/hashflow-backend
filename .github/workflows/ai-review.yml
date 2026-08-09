@@ -10,9 +10,12 @@ permissions:
   contents: read
   pull-requests: write
 
-# Cancel a running review if new commits are pushed to the PR.
+# Cancel a running review if new commits are pushed to the PR. The group is
+# scoped per event type: issue comments (e.g. the Trello card-link comment)
+# spawn runs that skip, and without this suffix they would cancel the real
+# pull_request review in progress.
 concurrency:
-  group: ai-review-${{ github.event.pull_request.number || github.event.issue.number }}
+  group: ai-review-${{ github.event.pull_request.number || github.event.issue.number }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
@@ -22,15 +25,16 @@ jobs:
       github.event_name == 'pull_request' ||
       (github.event.issue.pull_request && startsWith(github.event.comment.body || '', '/review'))
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     # Reviews are informational: never turn the PR red if the API hiccups.
     continue-on-error: true
     env:
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-      # openrouter/free auto-routes to the best available free model, so it
-      # keeps working as free models come and go. Pin a specific slug (e.g.
-      # google/gemma-4-31b-it:free) if you want consistent model quality.
-      MODEL: openrouter/free
+      # Free-only fallback list: try each pinned free model in order until one
+      # answers, with openrouter/free (auto-route) as the last resort.
+      # Free models are retired often — refresh the pins with:
+      #   curl -sS https://openrouter.ai/api/v1/models | jq -r '.data[].id' | grep ':free'
+      MODELS: openai/gpt-oss-20b:free,google/gemma-4-31b-it:free,cohere/north-mini-code:free,openrouter/free
       MAX_DIFF_CHARS: 30000
       PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
 
@@ -85,13 +89,29 @@ jobs:
           set -euo pipefail
           BASE="$BASE_SHA"
 
-          # Compute the PR diff (changes on the head branch since it diverged from base).
-          git diff "$BASE"...HEAD > /tmp/pr.diff || true
+          # Compute the PR diff (changes on the head branch since it diverged
+          # from base), excluding Gradle noise: .gradle caches and build/
+          # outputs are committed in this repo but are not reviewable code —
+          # the model cannot verify them and they are a top source of
+          # hallucinated comments.
+          git diff "$BASE"...HEAD -- . \
+            ':(exclude)**/.gradle/**' \
+            ':(exclude)**/build/**' \
+            ':(exclude)**/gradle-wrapper.jar' > /tmp/pr.diff || true
 
           if [ ! -s /tmp/pr.diff ]; then
-            gh pr comment "$PR_NUMBER" --body "🤖 AI review: no code changes to review in this PR."
+            gh pr comment "$PR_NUMBER" --body "🤖 AI review: no code changes to review in this PR (Gradle-cache/build-output-only or empty diff)."
             exit 0
           fi
+
+          # Repo facts: exact stack versions from the Gradle build files, so
+          # the model does not apply conventions from other frameworks or
+          # older major versions.
+          SPRING_BOOT=$(grep -hoE "org.springframework.boot.*version ['\"]?[0-9]+\.[0-9]+\.[0-9]+" build.gradle.kts services/service-telemetry/build.gradle 2>/dev/null | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" | sort -u | head -1 || true)
+          GRADLE=$(grep -hoE "gradle-[0-9.]+" gradle/wrapper/gradle-wrapper.properties services/service-telemetry/gradle/wrapper/gradle-wrapper.properties 2>/dev/null | head -1 | sed 's/^gradle-//' || true)
+          MODULES=$(grep -E '^[[:space:]]*include\(' settings.gradle.kts 2>/dev/null | sed -E 's/.*"([^"]+)".*/\1/' | tr '\n' ',' | sed 's/,$//' || echo "n/a")
+          REPO_FACTS="Spring Boot ${SPRING_BOOT:-n/a}, Gradle ${GRADLE:-n/a}, modules: ${MODULES:-n/a}; Java 17+ (Spring Boot 3 baseline); root package com.hashflow; service-telemetry uses Lombok, Spring Data JPA + PostgreSQL, and WebFlux"
+          echo "Repo facts: $REPO_FACTS"
 
           # Keep very large diffs within the model's context window.
           if [ "$(wc -c < /tmp/pr.diff)" -gt "$MAX_DIFF_CHARS" ]; then
@@ -108,37 +128,63 @@ jobs:
           /^ / { new_line++ }
           ' /tmp/pr.diff > /tmp/valid_lines.txt || true
 
-          PAYLOAD=$(jq -n \
-              --arg model "$MODEL" \
-              --rawfile diff /tmp/pr.diff \
-              '{
-                model: $model,
-                temperature: 0.2,
-                messages: [
-                  {
-                    role: "system",
-                    content: "You are a senior code reviewer for a Java + Spring Boot backend project (multi-module Gradle microservices). Review the pull request diff. Be concise and concrete. Flag real issues only — avoid nitpicks and false positives. Reply in the language of the PR description if it is not English."
-                  },
-                  {
-                    role: "user",
-                    content: ("Review this pull request diff. Respond with ONLY a JSON object — no markdown fences, no extra text. Shape:\n{\"summary\": \"2-3 sentence overview of what the PR does and your overall impression\", \"comments\": [{\"path\": \"path/to/File.java\", \"line\": 42, \"severity\": \"ERROR|WARNING|SUGGESTION\", \"message\": \"short description and suggested fix\", \"suggestion\": \"optional replacement code for that one line\"}]}\n\nRules:\n- \"path\" must match the diff exactly; \"line\" must be the line number in the NEW version of the file and must be a line added by this PR.\n- \"suggestion\" is optional: for issues with a clear mechanical fix, include the full replacement for the flagged line only, with the same indentation as the original line. Never wrap it in markdown fences.\n- Flag only real issues, at most 10 comments. Focus on bugs, logic errors, missing error handling, security problems (hardcoded secrets, unsafe patterns), concurrency and null-safety issues, and Spring/Java pitfalls (bean wiring, transactions, exception handling, resource leaks).\n- If there are no issues, return {\"summary\": \"...\", \"comments\": []}.\n\nDiff (truncated to the first part if very large):\n" + $diff)
-                  }
-                ]
-              }')
-
-          # Call the model with retries: free tiers are sometimes transiently unavailable.
+          # Try the pinned free models in order (fallback list), building the
+          # payload per model. Stops at the first model that returns content.
+          ACTUAL_MODEL=""
           RESPONSE=""
-          for attempt in 1 2 3; do
-            RESPONSE=$(curl -sS --max-time 90 https://openrouter.ai/api/v1/chat/completions \
-              -H "Authorization: Bearer $OPENROUTER_API_KEY" \
-              -H "Content-Type: application/json" \
-              -d "$PAYLOAD" || true)
-            if printf '%s' "$RESPONSE" | jq -e '.choices[0].message.content // empty' >/dev/null 2>&1; then
-              break
-            fi
-            echo "::warning::OpenRouter request attempt $attempt/3 failed; retrying in $((attempt * 5))s..."
-            sleep "$((attempt * 5))"
+          for MODEL in $(printf '%s' "$MODELS" | tr ',' ' '); do
+            echo "Trying model: $MODEL"
+            PAYLOAD=$(jq -n \
+                --arg model "$MODEL" \
+                --arg repo_facts "$REPO_FACTS" \
+                --rawfile diff /tmp/pr.diff \
+                '{
+                  model: $model,
+                  temperature: 0.2,
+                  messages: [
+                    {
+                      role: "system",
+                      content: ("You are a senior code reviewer for a Java + Spring Boot backend project (multi-module Gradle microservices: service-telemetry, service-financial, service-agent, service-news). Review the pull request diff. Be concise and concrete. Flag real issues only — avoid nitpicks and false positives. Reply in the language of the PR description if it is not English.\n\nREPO STACK (current versions — do not flag patterns as wrong based on older major versions or other frameworks):\n" + $repo_facts + "\n\nProject rules: contract-first (public API shapes come from the shared OpenAPI spec in hashflow-infra; services never define them locally), microservice isolation (database-per-service), and business rules RN01-RN12 are normative.")
+                    },
+                    {
+                      role: "user",
+                      content: ("Review this pull request diff. Respond with ONLY a JSON object — no markdown fences, no extra text. Shape:\n{\"summary\": \"2-3 sentence overview of what the PR does and your overall impression\", \"comments\": [{\"path\": \"path/to/File.java\", \"line\": 42, \"severity\": \"ERROR|WARNING|SUGGESTION\", \"message\": \"short description and suggested fix\", \"suggestion\": \"optional replacement code for that one line\"}]}\n\nRules:\n- \"path\" must match the diff exactly; \"line\" must be the line number in the NEW version of the file and must be a line added by this PR.\n- \"suggestion\" is optional: for issues with a clear mechanical fix, include the full replacement for the flagged line only, with the same indentation as the original line. Never wrap it in markdown fences.\n- Flag only real issues, at most 5 comments. Focus on bugs, logic errors, missing error handling, security problems (hardcoded secrets, unsafe patterns), concurrency and null-safety issues, and Spring/Java pitfalls (bean wiring, transactions, exception handling, resource leaks).\n- NEVER suggest code that is already present in the file or diff.\n- NEVER assert a fact you cannot verify from the provided files. If unsure about a library version, config, or ecosystem convention, phrase it as a question or omit it.\n- .gradle/ caches and build/ outputs are excluded from this diff; do not comment on them.\n- Prefer returning an empty comments array over inventing issues.\n- If there are no issues, return {\"summary\": \"...\", \"comments\": []}.\n\nDiff (truncated to the first part if very large):\n" + $diff)
+                    }
+                  ]
+                }')
+
+            for attempt in 1 2; do
+              RESPONSE=$(curl -sS --max-time 90 https://openrouter.ai/api/v1/chat/completions \
+                -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+                -H "Content-Type: application/json" \
+                -d "$PAYLOAD" || true)
+              CONTENT=$(printf '%s' "$RESPONSE" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
+              if [ -n "$CONTENT" ]; then
+                # Accept only a well-formed JSON review or a substantial text
+                # reply. Free-tier models occasionally return degenerate
+                # snippets (e.g. "User Safety: safe") — those are not reviews.
+                if printf '%s' "$CONTENT" | jq -e 'type == "object" and (has("summary") or has("comments"))' >/dev/null 2>&1 \
+                   || [ "${#CONTENT}" -ge 40 ]; then
+                  ACTUAL_MODEL="$MODEL"
+                  echo "Model $MODEL responded (attempt $attempt)."
+                  break 2
+                fi
+                echo "::warning::Model $MODEL returned degenerate output (${#CONTENT} chars); trying next model."
+                break
+              fi
+              echo "::warning::Model $MODEL attempt $attempt/2 failed; retrying in 5s..."
+              sleep 5
+            done
           done
+
+          if [ -z "$ACTUAL_MODEL" ]; then
+            ERROR=$(printf '%s' "$RESPONSE" | jq -r '.error.message // empty' 2>/dev/null || true)
+            [ -z "$ERROR" ] && ERROR="All models in the fallback list failed (check the Actions log for details)"
+            echo "::warning::OpenRouter review failed: $ERROR"
+            echo "::debug::OpenRouter response: $(printf '%s' "$RESPONSE" | head -c 500)"
+            gh pr comment "$PR_NUMBER" --body "🤖 AI review failed: $ERROR" || true
+            exit 0
+          fi
 
           REVIEW_JSON=$(printf '%s' "$RESPONSE" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
 
@@ -146,22 +192,20 @@ jobs:
           SUMMARY=$(printf '%s' "$REVIEW_JSON" | jq -r '.summary // empty' 2>/dev/null || true)
 
           if [ -z "$SUMMARY" ]; then
-            # Not JSON: post whatever the model said as a plain comment (or the API error).
-            if [ -z "$REVIEW_JSON" ]; then
-              ERROR=$(printf '%s' "$RESPONSE" | jq -r '.error.message // empty' 2>/dev/null || true)
-              [ -z "$ERROR" ] && ERROR="OpenRouter request failed after 3 attempts (check the Actions log for details)"
-              echo "::warning::OpenRouter review failed: $ERROR"
-              echo "::debug::OpenRouter response: $(printf '%s' "$RESPONSE" | head -c 500)"
-              gh pr comment "$PR_NUMBER" --body "🤖 AI review failed: $ERROR" || true
-            else
+            # Model output did not parse as the expected JSON shape. Post it as
+            # a plain comment only if it is substantial; skip degenerate output.
+            if printf '%s' "$REVIEW_JSON" | jq -e 'type == "object"' >/dev/null 2>&1 \
+               || [ "${#REVIEW_JSON}" -ge 40 ]; then
               BODY=$(cat <<EOF
           ## 🤖 AI Code Review
-          Model: \`$MODEL\`
+          Model: \`$ACTUAL_MODEL\`
 
           $REVIEW_JSON
           EOF
           )
               gh pr comment "$PR_NUMBER" --body "$BODY" || true
+            else
+              echo "::warning::Model returned degenerate output; skipping review post: $(printf '%s' "$REVIEW_JSON" | head -c 120)"
             fi
             exit 0
           fi
@@ -205,7 +249,7 @@ jobs:
 
           BODY=$(cat <<EOF
           ## 🤖 AI Code Review
-          Model: \`$MODEL\`
+          Model: \`$ACTUAL_MODEL\`
 
           $SUMMARY
           EOF
