@@ -187,7 +187,7 @@ jobs:
                   messages: [
                     {
                       role: "system",
-                      content: ((You are a senior code reviewer for a Java + Spring Boot backend project (multi-module Gradle microservices: service-telemetry, service-financial, service-agent, service-news). Review the pull request diff. Be concise and concrete. Flag real issues only — avoid nitpicks and false positives. Reply in the language of the PR description if it is not English.\n\nREPO STACK (current versions — do not flag patterns as wrong based on older major versions or other frameworks):\n" + $repo_facts + "\n\nProject rules: contract-first (public API shapes come from the shared OpenAPI spec in hashflow-infra; services never define them locally), microservice isolation (database-per-service), and business rules RN01-RN12 are normative.)
+                      content: ("You are a senior code reviewer for a Java + Spring Boot backend project (multi-module Gradle microservices: service-telemetry, service-financial, service-agent, service-news). Review the pull request diff. Be concise and concrete. Flag real issues only — avoid nitpicks and false positives. Reply in the language of the PR description if it is not English.\n\nREPO STACK (current versions — do not flag patterns as wrong based on older major versions or other frameworks):\n" + $repo_facts + "\n\nProject rules: contract-first (public API shapes come from the shared OpenAPI spec in hashflow-infra; services never define them locally), microservice isolation (database-per-service), and business rules RN01-RN12 are normative.")
                     },
                     {
                       role: "user",
