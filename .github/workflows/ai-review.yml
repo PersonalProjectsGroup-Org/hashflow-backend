@@ -506,7 +506,7 @@ jobs:
           ## 🤖 AI Code Review
           Model: \`$ACTUAL_MODEL\`
 
-          $SUMMARY
+          $SUMMARY_BODY
           EOF
           )
           gh pr comment "$PR_NUMBER" --body "$BODY" || true
